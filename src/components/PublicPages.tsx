@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Job, Company, BlogPost, FAQItem, Testimonial, ContactMessage, SystemSettings } from '../types';
+import TrustedCompanies from './TrustedCompanies';
 
 interface PublicPagesProps {
   route: string;
@@ -196,6 +197,9 @@ function HomePage({
           </div>
         </div>
       </section>
+
+      {/* TRUSTED BY LEADING COMPANIES SECTION */}
+      <TrustedCompanies />
 
       {/* WHY CHOOSE US */}
       <section className="py-24 bg-white border-b border-slate-100">
