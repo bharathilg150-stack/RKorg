@@ -524,43 +524,6 @@ function AboutPage({ settings }: { settings: SystemSettings }) {
         </div>
       </section>
 
-      {/* TEAM BIO */}
-      <section className="py-20 bg-white">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center space-y-12">
-          <div className="max-w-2xl mx-auto space-y-4">
-            <h2 className="text-2xl font-black text-[#0A2C66] uppercase tracking-tight">Our Leadership Desk</h2>
-            <p className="text-slate-500 text-xs font-semibold uppercase tracking-wider">Turenakx Recruitment Directors</p>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-12 max-w-3xl mx-auto">
-            <div className="bg-slate-50 border border-slate-100 p-8 rounded-2xl text-center space-y-4">
-              <div className="h-20 w-20 bg-[#0A2C66]/5 rounded-full mx-auto flex items-center justify-center">
-                <Users className="h-8 w-8 text-[#0A2C66]" />
-              </div>
-              <div>
-                <h3 className="text-[#0A2C66] font-bold text-lg">Bharathi L.G.</h3>
-                <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Managing Partner & Sourcing Expert</p>
-              </div>
-              <p className="text-slate-500 text-xs leading-relaxed max-w-sm mx-auto">
-                Oversees candidate discovery, resume validation matrix, and business operations out of Bangalore.
-              </p>
-            </div>
-
-            <div className="bg-slate-50 border border-slate-100 p-8 rounded-2xl text-center space-y-4">
-              <div className="h-20 w-20 bg-orange-50 rounded-full mx-auto flex items-center justify-center">
-                <Building2 className="h-8 w-8 text-[#F97316]" />
-              </div>
-              <div>
-                <h3 className="text-[#0A2C66] font-bold text-lg">Akshatha</h3>
-                <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Principal Agency Executive</p>
-              </div>
-              <p className="text-slate-500 text-xs leading-relaxed max-w-sm mx-auto">
-                Directs permanent placements, corporate mandate negotiations, and background vetting systems.
-              </p>
-            </div>
-          </div>
-        </div>
-      </section>
     </div>
   );
 }

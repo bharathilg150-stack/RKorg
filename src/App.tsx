@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import Navbar from './components/Navbar';
+import { supabase } from './lib/supabaseClient';
 import Footer from './components/Footer';
 import PublicPages from './components/PublicPages';
 import JobsPage from './components/JobsPage';
@@ -9,7 +10,7 @@ import EmployerPortal from './components/EmployerPortal';
 import AdminPanel from './components/AdminPanel';
 import { 
   UserSession, Job, Company, Candidate, Application, BlogPost, 
-  FAQItem, Testimonial, ContactMessage, SystemSettings, RealtimeAlert 
+  FAQItem, Testimonial, ContactMessage, SystemSettings, RealtimeAlert, AuditLog 
 } from './types';
 
 export default function App() {
@@ -25,6 +26,7 @@ export default function App() {
   const [faqs, setFaqs] = useState<FAQItem[]>([]);
   const [testimonials, setTestimonials] = useState<Testimonial[]>([]);
   const [contactMessages, setContactMessages] = useState<ContactMessage[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [settings, setSettings] = useState<SystemSettings>({
     phone: '+91 8147354351',
     companyEmail: 'rkturenakx@gmail.com',
@@ -61,6 +63,7 @@ export default function App() {
         setFaqs(data.db.faqs || []);
         setTestimonials(data.db.testimonials || []);
         setContactMessages(data.db.contactMessages || []);
+        setAuditLogs(data.db.auditLogs || []);
         if (data.db.settings) {
           setSettings(data.db.settings);
         }
@@ -112,6 +115,28 @@ export default function App() {
     return () => {
       eventSource.close();
     };
+  }, []);
+
+  // Set up Supabase Realtime Postgres Changes Subscription
+  useEffect(() => {
+    const supabaseUrl = (import.meta as any).env.NEXT_PUBLIC_SUPABASE_URL || (import.meta as any).env.VITE_SUPABASE_URL;
+    if (supabaseUrl) {
+      const channel = supabase
+        .channel('schema-db-changes')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public' },
+          (payload) => {
+            console.log('Instant Supabase Realtime sync:', payload);
+            fetchData();
+          }
+        )
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    }
   }, []);
 
   // Helper to load candidate / employer profiles
@@ -626,11 +651,13 @@ export default function App() {
                 faqs={faqs} 
                 testimonials={testimonials} 
                 contactMessages={contactMessages} 
+                auditLogs={auditLogs} 
                 settings={settings} 
                 realtimeAlerts={realtimeAlerts} 
                 loginAdmin={loginAdmin} 
                 updateJob={updateJob} 
                 deleteJob={deleteJob} 
+                createJob={createJob} 
                 updateCompany={updateCompany} 
                 updateCandidate={updateCandidate} 
                 updateApplicationStatus={updateApplicationStatus} 

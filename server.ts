@@ -4,6 +4,7 @@ import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
+import { getSupabaseAdmin } from './src/lib/supabaseClient.js';
 
 dotenv.config();
 
@@ -551,13 +552,327 @@ function saveDB(db: any) {
   notifyRealtimeClients();
 }
 
+// ========================================================
+// SUPABASE DUAL-MODE ENGINE & HELPER ADAPTERS
+// ========================================================
+
+function isSupabaseConfigured() {
+  return !!(process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+async function getSupabaseDB() {
+  const admin = getSupabaseAdmin();
+  
+  const [
+    { data: jobs },
+    { data: companies },
+    { data: candidates },
+    { data: applications },
+    { data: blogs },
+    { data: faqs },
+    { data: testimonials },
+    { data: contactMessages },
+    { data: auditLogs },
+    { data: settingsData }
+  ] = await Promise.all([
+    admin.from('jobs').select('*').order('created_at', { ascending: false }),
+    admin.from('companies').select('*').order('created_at', { ascending: false }),
+    admin.from('candidates').select('*').order('created_at', { ascending: false }),
+    admin.from('applications').select('*').order('applied_at', { ascending: false }),
+    admin.from('blogs').select('*').order('date', { ascending: false }),
+    admin.from('faqs').select('*'),
+    admin.from('testimonials').select('*'),
+    admin.from('contact_messages').select('*').order('created_at', { ascending: false }),
+    admin.from('activity_logs').select('*').order('timestamp', { ascending: false }),
+    admin.from('settings').select('*').eq('id', 'global').maybeSingle()
+  ]);
+
+  return {
+    jobs: jobs || [],
+    companies: (companies || []).map((c: any) => ({ ...c, logoUrl: c.logo_url })),
+    candidates: (candidates || []).map((c: any) => ({
+      ...c,
+      resumeText: c.resume_text,
+      savedJobs: c.saved_jobs || [],
+      backgroundVerified: c.background_verified,
+    })),
+    applications: (applications || []).map((a: any) => ({
+      ...a,
+      jobId: a.job_id,
+      jobTitle: a.job_title,
+      candidateId: a.candidate_id,
+      candidateName: a.candidate_name,
+      candidateEmail: a.candidate_email,
+      candidatePhone: a.candidate_phone,
+      resumeText: a.resume_text,
+      resumeScore: a.resume_score,
+      resumeAnalysis: a.resume_analysis,
+      interviewDate: a.interview_date,
+      interviewTime: a.interview_time,
+      interviewLink: a.interview_link,
+      appliedAt: a.applied_at
+    })),
+    blogs: (blogs || []).map((b: any) => ({
+      ...b,
+      image: b.image || ''
+    })),
+    faqs: faqs || [],
+    testimonials: testimonials || [],
+    contactMessages: (contactMessages || []).map((cm: any) => ({
+      ...cm,
+      createdAt: cm.created_at
+    })),
+    auditLogs: (auditLogs || []).map((l: any) => ({
+      id: l.id,
+      user: l.user_name,
+      action: l.action,
+      target: l.target,
+      timestamp: l.timestamp
+    })),
+    settings: settingsData || {
+      companyName: 'Turenakx Staffing & Recruitment Agency',
+      tagline: 'Right People. Right Jobs. Right Future.',
+      phone: '+91 8147354351',
+      personalEmail: 'bharathilg150@gmail.com',
+      companyEmail: 'rkturenakx@gmail.com',
+      address: '#815, 8th Floor, Sowparnika Pranathi Apartment, Kumbalagudu, Bangalore – 560074, Karnataka, India',
+      whatsapp: '+918147354351',
+      mapUrl: 'https://maps.google.com/?q=Sowparnika+Pranathi+Apartment+Kumbalagudu+Bangalore',
+      socialLinks: { linkedin: '', facebook: '', twitter: '', instagram: '' },
+      smtpSettings: { host: '', port: '', user: '' },
+      seoSettings: { titleTemplate: '', defaultDescription: '', keywords: [] }
+    }
+  };
+}
+
+async function bootstrapSupabase() {
+  if (!isSupabaseConfigured()) {
+    console.log('Supabase environment variables not configured yet. Fallback local json db mode active.');
+    return;
+  }
+  
+  try {
+    const admin = getSupabaseAdmin();
+    console.log('Supabase credentials detected. Running auto-initializer and storage check...');
+    
+    // 1. Create storage buckets
+    const buckets = ['resumes', 'company-logos', 'blog-images', 'profile-images', 'documents', 'website-assets'];
+    for (const b of buckets) {
+      await admin.storage.createBucket(b, { public: true }).catch((e: any) => {});
+    }
+    
+    // 2. Run schema check & seed if empty
+    const { data: existingJobs, error: selectErr } = await admin.from('jobs').select('id').limit(1);
+    if (selectErr) {
+      console.error('⚠ Error checking jobs table in Supabase. Have you run /supabase_schema.sql inside your Supabase SQL Editor?', selectErr.message || selectErr);
+      return;
+    }
+
+    if (!existingJobs || existingJobs.length === 0) {
+      console.log('Supabase tables are empty. Initiating automatic data seeding from data/db.json...');
+      const localDB = getDB();
+      
+      // A. Settings
+      if (localDB.settings) {
+        await admin.from('settings').upsert({
+          id: 'global',
+          company_name: localDB.settings.companyName || 'Turenakx Staffing & Recruitment Agency',
+          tagline: localDB.settings.tagline || '',
+          phone: localDB.settings.phone || '',
+          personal_email: localDB.settings.personalEmail || '',
+          company_email: localDB.settings.companyEmail || '',
+          address: localDB.settings.address || '',
+          whatsapp: localDB.settings.whatsapp || '',
+          map_url: localDB.settings.mapUrl || '',
+          social_links: localDB.settings.socialLinks || {},
+          smtp_settings: localDB.settings.smtpSettings || {},
+          seo_settings: localDB.settings.seoSettings || {}
+        });
+      }
+
+      // B. Companies
+      if (localDB.companies && localDB.companies.length > 0) {
+        await admin.from('companies').insert(localDB.companies.map((c: any) => ({
+          id: c.id,
+          name: c.name,
+          logo_url: c.logoUrl || c.logo || '',
+          industry: c.industry || '',
+          contact_email: c.contactEmail,
+          contact_phone: c.contactPhone || '',
+          address: c.address || '',
+          location: c.location || '',
+          description: c.description || '',
+          status: c.status || 'approved',
+          is_featured: c.isFeatured || false,
+          website: c.website || '',
+          created_at: c.created_at || new Date().toISOString()
+        })));
+      }
+
+      // C. Candidates
+      if (localDB.candidates && localDB.candidates.length > 0) {
+        await admin.from('candidates').insert(localDB.candidates.map((cand: any) => ({
+          id: cand.id,
+          name: cand.name,
+          email: cand.email,
+          phone: cand.phone || '',
+          resume_text: cand.resumeText || cand.resume_text || '',
+          skills: cand.skills || [],
+          experience: cand.experience || [],
+          education: cand.education || [],
+          saved_jobs: cand.savedJobs || [],
+          certificates: cand.certificates || [],
+          background_verified: cand.backgroundVerified || false,
+          created_at: cand.created_at || new Date().toISOString()
+        })));
+      }
+
+      // D. Jobs
+      if (localDB.jobs && localDB.jobs.length > 0) {
+        await admin.from('jobs').insert(localDB.jobs.map((j: any) => ({
+          id: j.id,
+          title: j.title,
+          description: j.description || '',
+          requirements: j.requirements || [],
+          salary: j.salary || '',
+          experience: j.experience || '',
+          location: j.location || '',
+          skills: j.skills || [],
+          type: j.type || 'Full Time',
+          industry: j.industry || '',
+          status: j.status || 'active',
+          company_id: j.companyId,
+          company_name: j.companyName || '',
+          company_logo: j.companyLogo || '',
+          company_location: j.companyLocation || '',
+          created_at: j.created_at || new Date().toISOString(),
+          expiry_date: j.expiry_date || new Date(Date.now() + 30*24*3600*1000).toISOString(),
+          applied_count: j.appliedCount || 0
+        })));
+      }
+
+      // E. Applications
+      if (localDB.applications && localDB.applications.length > 0) {
+        await admin.from('applications').insert(localDB.applications.map((a: any) => ({
+          id: a.id,
+          job_id: a.jobId,
+          job_title: a.jobTitle,
+          candidate_id: a.candidateId,
+          candidate_name: a.candidateName,
+          candidate_email: a.candidateEmail,
+          candidate_phone: a.candidatePhone || '',
+          resume_text: a.resumeText || '',
+          resume_score: a.resumeScore || 0,
+          resume_analysis: a.resumeAnalysis || {},
+          status: a.status || 'applied',
+          notes: a.notes || '',
+          interview_date: a.interviewDate || '',
+          interview_time: a.interviewTime || '',
+          interview_link: a.interviewLink || '',
+          applied_at: a.appliedAt || new Date().toISOString()
+        })));
+      }
+
+      // F. Blogs
+      if (localDB.blogs && localDB.blogs.length > 0) {
+        await admin.from('blogs').insert(localDB.blogs.map((b: any) => ({
+          id: b.id,
+          title: b.title,
+          slug: b.slug,
+          content: b.content,
+          summary: b.summary || '',
+          author: b.author || '',
+          category: b.category || '',
+          date: b.date || '',
+          image: b.image || '',
+          status: b.status || 'published',
+          views: b.views || 0
+        })));
+      }
+
+      // G. FAQs
+      if (localDB.faqs && localDB.faqs.length > 0) {
+        await admin.from('faqs').insert(localDB.faqs.map((f: any) => ({
+          id: f.id,
+          question: f.question,
+          answer: f.answer,
+          category: f.category || ''
+        })));
+      }
+
+      // H. Testimonials
+      if (localDB.testimonials && localDB.testimonials.length > 0) {
+        await admin.from('testimonials').insert(localDB.testimonials.map((t: any) => ({
+          id: t.id,
+          author: t.author,
+          role: t.role || '',
+          company: t.company || '',
+          text: t.text,
+          rating: t.rating || 5,
+          image: t.image || ''
+        })));
+      }
+
+      // I. Contact Messages
+      if (localDB.contactMessages && localDB.contactMessages.length > 0) {
+        await admin.from('contact_messages').insert(localDB.contactMessages.map((cm: any) => ({
+          id: cm.id,
+          name: cm.name,
+          email: cm.email,
+          phone: cm.phone || '',
+          subject: cm.subject || '',
+          message: cm.message || '',
+          status: cm.status || 'unread',
+          created_at: cm.created_at || cm.createdAt || new Date().toISOString()
+        })));
+      }
+
+      // J. Audit Logs
+      if (localDB.auditLogs && localDB.auditLogs.length > 0) {
+        await admin.from('activity_logs').insert(localDB.auditLogs.map((l: any) => ({
+          id: l.id,
+          user_name: l.user,
+          action: l.action,
+          target: l.target,
+          timestamp: l.timestamp || new Date().toISOString()
+        })));
+      }
+
+      console.log('✓ Supabase successfully seeded with live initial operational profiles.');
+    } else {
+      console.log('Supabase tables contain active live records. Seed operation skipped.');
+    }
+  } catch (err: any) {
+    console.error('Failed to run automatic Supabase initialization:', err.message || err);
+  }
+}
+
 // Realtime SSE Subscriptions
 let realtimeClients: any[] = [];
 
 function notifyRealtimeClients() {
   console.log(`Broadcasting real-time update to ${realtimeClients.length} connected clients...`);
+  const alert = {
+    id: `alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    message: 'System database synchronized successfully.',
+    timestamp: new Date().toISOString()
+  };
   realtimeClients.forEach(client => {
     client.write(`event: data-updated\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
+    client.write(`data: ${JSON.stringify(alert)}\n\n`);
+  });
+}
+
+function broadcastAlert(message: string) {
+  const alert = {
+    id: `alert-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    message,
+    timestamp: new Date().toISOString()
+  };
+  console.log(`SSE alert broadcast: ${message}`);
+  realtimeClients.forEach(client => {
+    client.write(`event: data-updated\ndata: ${JSON.stringify({ timestamp: new Date().toISOString() })}\n\n`);
+    client.write(`data: ${JSON.stringify(alert)}\n\n`);
   });
 }
 
@@ -572,7 +887,12 @@ app.get('/api/realtime-updates', (req, res) => {
   console.log(`Client subscribed to SSE. Total subscribers: ${realtimeClients.length}`);
 
   // Send initial ping
-  res.write(`data: ${JSON.stringify({ status: 'connected' })}\n\n`);
+  const initialAlert = {
+    id: 'initial-ping',
+    message: 'Subscribed to real-time administrative intelligence feed.',
+    timestamp: new Date().toISOString()
+  };
+  res.write(`data: ${JSON.stringify(initialAlert)}\n\n`);
 
   req.on('close', () => {
     realtimeClients = realtimeClients.filter(client => client !== res);
@@ -581,13 +901,52 @@ app.get('/api/realtime-updates', (req, res) => {
 });
 
 // API: Get entire Database (For frontend initial load and polling fallback)
-app.get('/api/db', (req, res) => {
+app.get('/api/db', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const db = await getSupabaseDB();
+      return res.json({ success: true, db });
+    } catch (err: any) {
+      console.error('Error fetching Supabase DB, falling back to local JSON:', err.message || err);
+    }
+  }
   const db = getDB();
-  res.json(db);
+  res.json({ success: true, db });
 });
 
 // API: Submit Contact Message
-app.post('/api/messages', (req, res) => {
+app.post('/api/messages', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newMessage = {
+        id: `msg-${Date.now()}`,
+        name: req.body.name,
+        email: req.body.email,
+        phone: req.body.phone || '',
+        subject: req.body.subject,
+        message: req.body.message,
+        status: 'unread',
+        created_at: new Date().toISOString()
+      };
+      
+      await admin.from('contact_messages').insert(newMessage);
+      
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: 'Guest User',
+        action: 'Contact Message Submission',
+        target: `${newMessage.name} (${newMessage.subject})`,
+        timestamp: new Date().toISOString()
+      });
+
+      broadcastAlert(`New contact form message from ${newMessage.name}: "${newMessage.subject}"`);
+      return res.status(201).json({ success: true, message: newMessage });
+    } catch (err: any) {
+      console.error('Supabase message create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newMessage = {
     id: `msg-${Date.now()}`,
@@ -597,7 +956,6 @@ app.post('/api/messages', (req, res) => {
   };
   db.contactMessages.unshift(newMessage);
   
-  // Log inside audit
   db.auditLogs.unshift({
     id: `log-${Date.now()}`,
     user: 'Guest User',
@@ -607,18 +965,252 @@ app.post('/api/messages', (req, res) => {
   });
 
   saveDB(db);
+  broadcastAlert(`New contact form message from ${newMessage.name}: "${newMessage.subject}"`);
   res.status(201).json({ success: true, message: newMessage });
 });
 
+// API: Update Contact Message Status
+app.put('/api/messages/:id/status', async (req, res) => {
+  const { status } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: original } = await admin.from('contact_messages').select('*').eq('id', req.params.id).maybeSingle();
+      if (original) {
+        await admin.from('contact_messages').update({ status }).eq('id', req.params.id);
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: `Contact Message Status: ${status}`,
+          target: original.name,
+          timestamp: new Date().toISOString()
+        });
+        broadcastAlert(`Contact message from ${original.name} marked as ${status}`);
+        return res.json({ success: true, message: { ...original, status } });
+      }
+    } catch (err: any) {
+      console.error('Supabase status update error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const index = db.contactMessages.findIndex((m: any) => m.id === req.params.id);
+  if (index !== -1) {
+    db.contactMessages[index].status = status;
+    
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin',
+      action: `Contact Message Status: ${status}`,
+      target: db.contactMessages[index].name,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Contact message from ${db.contactMessages[index].name} marked as ${status}`);
+    return res.json({ success: true, message: db.contactMessages[index] });
+  }
+  res.status(404).json({ success: false, message: 'Message not found' });
+});
+
+// API: Reply to Contact Message
+app.post('/api/messages/:id/reply', async (req, res) => {
+  const { replyText } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: original } = await admin.from('contact_messages').select('*').eq('id', req.params.id).maybeSingle();
+      if (original) {
+        await admin.from('contact_messages').update({ status: 'replied' }).eq('id', req.params.id);
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Replied to Contact Inquiry',
+          target: original.email,
+          timestamp: new Date().toISOString()
+        });
+        broadcastAlert(`Sent agency reply email to ${original.name}`);
+        return res.json({ success: true, message: { ...original, status: 'replied', reply: replyText } });
+      }
+    } catch (err: any) {
+      console.error('Supabase message reply error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const index = db.contactMessages.findIndex((m: any) => m.id === req.params.id);
+  if (index !== -1) {
+    db.contactMessages[index].status = 'replied';
+    db.contactMessages[index].reply = replyText;
+    
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin',
+      action: 'Replied to Contact Inquiry',
+      target: db.contactMessages[index].email,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Sent agency reply email to ${db.contactMessages[index].name}`);
+    return res.json({ success: true, message: db.contactMessages[index] });
+  }
+  res.status(404).json({ success: false, message: 'Message not found' });
+});
+
+// API: Delete Contact Message
+app.delete('/api/messages/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: original } = await admin.from('contact_messages').select('*').eq('id', req.params.id).maybeSingle();
+      if (original) {
+        await admin.from('contact_messages').delete().eq('id', req.params.id);
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Deleted Contact Message',
+          target: original.name,
+          timestamp: new Date().toISOString()
+        });
+        broadcastAlert(`Contact message from ${original.name} deleted successfully`);
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase message delete error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const index = db.contactMessages.findIndex((m: any) => m.id === req.params.id);
+  if (index !== -1) {
+    const msg = db.contactMessages[index];
+    db.contactMessages.splice(index, 1);
+    
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin',
+      action: 'Deleted Contact Message',
+      target: msg.name,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Contact message from ${msg.name} deleted successfully`);
+    return res.json({ success: true });
+  }
+  res.status(404).json({ success: false, message: 'Message not found' });
+});
+
 // API: Auth Login Endpoint
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password, role } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      
+      if (role === 'admin') {
+        if (email === 'rkturenak@gmail.com' && password === 'Akshatha agency') {
+          await admin.from('activity_logs').insert({
+            id: `log-${Date.now()}`,
+            user_name: 'rkturenak@gmail.com',
+            action: 'Admin Login',
+            target: 'Admin Dashboard',
+            timestamp: new Date().toISOString()
+          });
+          
+          const adminSession = {
+            id: 'admin-1',
+            name: 'Akshatha - Turenakx Admin',
+            email: 'rkturenak@gmail.com',
+            role: 'admin' as const
+          };
+          return res.json({ success: true, user: adminSession, session: adminSession });
+        }
+        return res.status(401).json({ success: false, message: 'Invalid Admin credentials' });
+      }
+
+      // Check if user exists in auth.users by logging them in or querying profiles
+      const { data: authSession, error: authErr } = await admin.auth.signInWithPassword({
+        email,
+        password
+      }).catch(() => ({ data: null, error: { message: 'Authentication required' } }));
+
+      let verifiedUser = null;
+
+      if (authSession?.user) {
+        const { data: profile } = await admin.from('profiles').select('*').eq('id', authSession.user.id).maybeSingle();
+        verifiedUser = {
+          id: authSession.user.id,
+          name: profile?.name || email.split('@')[0].toUpperCase(),
+          email: authSession.user.email,
+          role: role
+        };
+      } else {
+        if (role === 'candidate') {
+          const { data: cand } = await admin.from('candidates').select('*').eq('email', email).maybeSingle();
+          if (cand) {
+            verifiedUser = { id: cand.id, name: cand.name, email: cand.email, role: 'candidate' as const };
+          } else {
+            const newCandId = `cand-${Date.now()}`;
+            const newCand = {
+              id: newCandId,
+              name: email.split('@')[0].toUpperCase(),
+              email,
+              skills: [],
+              experience: [],
+              education: [],
+              saved_jobs: [],
+              certificates: [],
+              background_verified: false,
+              created_at: new Date().toISOString()
+            };
+            await admin.from('candidates').insert(newCand);
+            verifiedUser = { id: newCandId, name: newCand.name, email, role: 'candidate' as const };
+          }
+        } else if (role === 'employer') {
+          const { data: comp } = await admin.from('companies').select('*').eq('contact_email', email).maybeSingle();
+          if (comp) {
+            if (comp.status === 'suspended') {
+              return res.status(403).json({ success: false, message: 'Your employer account has been suspended.' });
+            }
+            verifiedUser = { id: `emp-${comp.id}`, name: comp.name, email: comp.contact_email, role: 'employer' as const, companyId: comp.id };
+          } else {
+            const newCompId = `company-${Date.now()}`;
+            const newCompany = {
+              id: newCompId,
+              name: `${email.split('@')[0].toUpperCase()} Enterprise`,
+              industry: 'IT & Software',
+              contact_email: email,
+              contact_phone: '+91 8147354351',
+              address: 'Kumbalagudu, Bangalore',
+              description: 'Corporate business seeking elite professionals.',
+              status: 'approved',
+              created_at: new Date().toISOString()
+            };
+            await admin.from('companies').insert(newCompany);
+            verifiedUser = { id: `emp-${newCompId}`, name: newCompany.name, email, role: 'employer' as const, companyId: newCompId };
+          }
+        }
+      }
+
+      if (verifiedUser) {
+        return res.json({ success: true, user: verifiedUser, session: verifiedUser });
+      }
+      return res.status(401).json({ success: false, message: 'Invalid credentials' });
+    } catch (err: any) {
+      console.error('Supabase auth login error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
 
-  // Admin login
+  // Admin login fallback
   if (role === 'admin') {
     if (email === 'rkturenak@gmail.com' && password === 'Akshatha agency') {
-      // Log inside audit
       db.auditLogs.unshift({
         id: `log-${Date.now()}`,
         user: 'rkturenak@gmail.com',
@@ -644,7 +1236,7 @@ app.post('/api/auth/login', (req, res) => {
     return res.status(401).json({ success: false, message: 'Invalid Admin credentials' });
   }
 
-  // Candidate login
+  // Candidate login fallback
   if (role === 'candidate') {
     const candidate = db.candidates.find((c: any) => c.email.toLowerCase() === email.toLowerCase());
     if (candidate) {
@@ -660,7 +1252,6 @@ app.post('/api/auth/login', (req, res) => {
         session: candidateSession
       });
     }
-    // Auto-create/register candidate on first login for demo fluidity (with success message)
     const newCand = {
       id: `cand-${Date.now()}`,
       name: email.split('@')[0].toUpperCase(),
@@ -688,7 +1279,7 @@ app.post('/api/auth/login', (req, res) => {
     });
   }
 
-  // Employer login
+  // Employer login fallback
   if (role === 'employer') {
     const company = db.companies.find((c: any) => c.contactEmail.toLowerCase() === email.toLowerCase());
     if (company) {
@@ -708,7 +1299,6 @@ app.post('/api/auth/login', (req, res) => {
         session: employerSession
       });
     }
-    // Auto-create employer/company on first login for demonstration speed
     const newCompany = {
       id: `company-${Date.now()}`,
       name: `${email.split('@')[0].toUpperCase()} Enterprise`,
@@ -742,8 +1332,71 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // API: Auth Register Endpoint
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   const { email, password, role, name } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: authData, error: authErr } = await admin.auth.admin.createUser({
+        email,
+        password: password || 'SecureDefaultPassword123!',
+        email_confirm: true
+      });
+      
+      if (authErr && authErr.message !== 'A user with this email already exists') {
+        return res.status(400).json({ success: false, message: authErr.message });
+      }
+      
+      const userId = authData?.user?.id || `user-${Date.now()}`;
+
+      await admin.from('profiles').upsert({
+        id: userId,
+        email,
+        name: name || email.split('@')[0].toUpperCase(),
+        role: role === 'candidate' ? 'Candidate' : 'Employer',
+        created_at: new Date().toISOString()
+      });
+
+      if (role === 'candidate') {
+        const newCand = {
+          id: userId,
+          name: name || email.split('@')[0].toUpperCase(),
+          email,
+          phone: '+91 8147354351',
+          resume_text: '',
+          skills: [],
+          experience: [],
+          education: [],
+          saved_jobs: [],
+          certificates: [],
+          background_verified: false,
+          created_at: new Date().toISOString()
+        };
+        await admin.from('candidates').insert(newCand);
+        return res.json({ success: true, userId });
+      }
+
+      if (role === 'employer') {
+        const newCompany = {
+          id: userId,
+          name: name || `${email.split('@')[0].toUpperCase()} Enterprise`,
+          industry: 'IT & Software',
+          contact_email: email,
+          contact_phone: '+91 8147354351',
+          address: 'Kumbalagudu, Bangalore',
+          description: 'Corporate business seeking elite professionals.',
+          status: 'approved',
+          created_at: new Date().toISOString()
+        };
+        await admin.from('companies').insert(newCompany);
+        return res.json({ success: true, userId });
+      }
+    } catch (err: any) {
+      console.error('Supabase auth register error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
 
   if (role === 'candidate') {
@@ -791,12 +1444,38 @@ app.post('/api/auth/register', (req, res) => {
 });
 
 // API: Auth Admin-Login Endpoint
-app.post('/api/auth/admin-login', (req, res) => {
+app.post('/api/auth/admin-login', async (req, res) => {
   const { email, password } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      if (email === 'rkturenak@gmail.com' && password === 'Akshatha agency') {
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'rkturenak@gmail.com',
+          action: 'Admin Login',
+          target: 'Admin Dashboard',
+          timestamp: new Date().toISOString()
+        });
+        
+        const adminSession = {
+          id: 'admin-1',
+          name: 'Akshatha - Turenakx Admin',
+          email: 'rkturenak@gmail.com',
+          role: 'admin' as const
+        };
+        return res.json({ success: true, user: adminSession, session: adminSession });
+      }
+      return res.status(401).json({ success: false, message: 'Invalid Admin credentials' });
+    } catch (err: any) {
+      console.error('Supabase admin login error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
 
   if (email === 'rkturenak@gmail.com' && password === 'Akshatha agency') {
-    // Log inside audit
     db.auditLogs.unshift({
       id: `log-${Date.now()}`,
       user: 'rkturenak@gmail.com',
@@ -824,7 +1503,48 @@ app.post('/api/auth/admin-login', (req, res) => {
 });
 
 // API: Jobs CRUD Operations
-app.post('/api/jobs', (req, res) => {
+app.post('/api/jobs', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newJob = {
+        id: `job-${Date.now()}`,
+        title: req.body.title,
+        description: req.body.description,
+        requirements: req.body.requirements || [],
+        salary: req.body.salary,
+        experience: req.body.experience,
+        location: req.body.location,
+        skills: req.body.skills || [],
+        type: req.body.type,
+        industry: req.body.industry,
+        status: req.body.status || 'active',
+        company_id: req.body.companyId,
+        company_name: req.body.companyName || '',
+        company_logo: req.body.companyLogo || '',
+        company_location: req.body.companyLocation || '',
+        created_at: new Date().toISOString(),
+        expiry_date: req.body.expiry_date || new Date(Date.now() + 30*24*3600*1000).toISOString(),
+        applied_count: 0
+      };
+
+      await admin.from('jobs').insert(newJob);
+
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: req.body.companyName || 'Employer',
+        action: 'Job Posting Created',
+        target: newJob.title,
+        timestamp: new Date().toISOString()
+      });
+
+      broadcastAlert(`New job posted: "${newJob.title}" at ${newJob.company_name}`);
+      return res.status(201).json({ success: true, job: newJob });
+    } catch (err: any) {
+      console.error('Supabase job create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newJob = {
     id: `job-${Date.now()}`,
@@ -835,7 +1555,6 @@ app.post('/api/jobs', (req, res) => {
   };
   db.jobs.unshift(newJob);
 
-  // Log inside audit
   db.auditLogs.unshift({
     id: `log-${Date.now()}`,
     user: req.body.companyName || 'Employer',
@@ -848,7 +1567,44 @@ app.post('/api/jobs', (req, res) => {
   res.status(201).json({ success: true, job: newJob });
 });
 
-app.put('/api/jobs/:id', (req, res) => {
+app.put('/api/jobs/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: job } = await admin.from('jobs').select('*').eq('id', req.params.id).maybeSingle();
+      if (job) {
+        const updateFields = {
+          title: req.body.title || job.title,
+          description: req.body.description || job.description,
+          requirements: req.body.requirements || job.requirements,
+          salary: req.body.salary || job.salary,
+          experience: req.body.experience || job.experience,
+          location: req.body.location || job.location,
+          skills: req.body.skills || job.skills,
+          type: req.body.type || job.type,
+          industry: req.body.industry || job.industry,
+          status: req.body.status || job.status,
+          expiry_date: req.body.expiry_date || job.expiry_date
+        };
+
+        await admin.from('jobs').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin/Employer',
+          action: 'Job Posting Updated',
+          target: updateFields.title,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Job updated: "${updateFields.title}"`);
+        return res.json({ success: true, job: { ...job, ...updateFields } });
+      }
+    } catch (err: any) {
+      console.error('Supabase job update error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const jobIndex = db.jobs.findIndex((j: any) => j.id === req.params.id);
   if (jobIndex !== -1) {
@@ -868,7 +1624,28 @@ app.put('/api/jobs/:id', (req, res) => {
   res.status(404).json({ success: false, message: 'Job not found' });
 });
 
-app.delete('/api/jobs/:id', (req, res) => {
+app.delete('/api/jobs/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: job } = await admin.from('jobs').select('*').eq('id', req.params.id).maybeSingle();
+      if (job) {
+        await admin.from('jobs').delete().eq('id', req.params.id);
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin/Employer',
+          action: 'Job Posting Deleted',
+          target: job.title,
+          timestamp: new Date().toISOString()
+        });
+        broadcastAlert(`Job deleted: "${job.title}"`);
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase job delete error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const jobIndex = db.jobs.findIndex((j: any) => j.id === req.params.id);
   if (jobIndex !== -1) {
@@ -890,7 +1667,53 @@ app.delete('/api/jobs/:id', (req, res) => {
 });
 
 // API: Submit Job Application
-app.post('/api/applications', (req, res) => {
+app.post('/api/applications', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newApp = {
+        id: `app-${Date.now()}`,
+        job_id: req.body.jobId,
+        job_title: req.body.jobTitle,
+        candidate_id: req.body.candidateId,
+        candidate_name: req.body.candidateName,
+        candidate_email: req.body.candidateEmail,
+        candidate_phone: req.body.candidatePhone || '',
+        resume_text: req.body.resumeText,
+        resume_score: req.body.resumeScore || 0,
+        resume_analysis: req.body.resumeAnalysis || {},
+        status: 'applied',
+        notes: req.body.notes || '',
+        applied_at: new Date().toISOString()
+      };
+
+      await admin.from('applications').insert(newApp);
+
+      const { data: job } = await admin.from('jobs').select('applied_count').eq('id', newApp.job_id).maybeSingle();
+      if (job) {
+        await admin.from('jobs').update({ applied_count: (job.applied_count || 0) + 1 }).eq('id', newApp.job_id);
+      }
+
+      await admin.from('candidates').update({
+        resume_text: newApp.resume_text,
+        phone: newApp.candidate_phone
+      }).eq('id', newApp.candidate_id);
+
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: newApp.candidate_name,
+        action: 'Job Application Submitted',
+        target: newApp.job_title,
+        timestamp: new Date().toISOString()
+      });
+
+      broadcastAlert(`New application from ${newApp.candidate_name} for "${newApp.job_title}"`);
+      return res.status(201).json({ success: true, application: newApp });
+    } catch (err: any) {
+      console.error('Supabase application submit error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newApp = {
     id: `app-${Date.now()}`,
@@ -900,20 +1723,17 @@ app.post('/api/applications', (req, res) => {
   };
   db.applications.unshift(newApp);
 
-  // Increment appliedCount on the job
   const job = db.jobs.find((j: any) => j.id === newApp.jobId);
   if (job) {
     job.appliedCount = (job.appliedCount || 0) + 1;
   }
 
-  // Update candidate details if missing phone or resume
   const candidate = db.candidates.find((c: any) => c.id === newApp.candidateId);
   if (candidate) {
     candidate.resumeText = newApp.resumeText;
     if (newApp.candidatePhone) candidate.phone = newApp.candidatePhone;
   }
 
-  // Log inside audit
   db.auditLogs.unshift({
     id: `log-${Date.now()}`,
     user: newApp.candidateName,
@@ -926,7 +1746,38 @@ app.post('/api/applications', (req, res) => {
   res.status(201).json({ success: true, application: newApp });
 });
 
-app.put('/api/applications/:id', (req, res) => {
+app.put('/api/applications/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: appData } = await admin.from('applications').select('*').eq('id', req.params.id).maybeSingle();
+      if (appData) {
+        const updateFields = {
+          status: req.body.status || appData.status,
+          notes: req.body.notes || appData.notes,
+          interview_date: req.body.interviewDate || appData.interview_date,
+          interview_time: req.body.interviewTime || appData.interview_time,
+          interview_link: req.body.interviewLink || appData.interview_link
+        };
+
+        await admin.from('applications').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Recruiter/Admin',
+          action: `Application Stage Update: ${updateFields.status}`,
+          target: `App for ${appData.job_title} by ${appData.candidate_name}`,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Application for ${appData.candidate_name} updated to stage ${updateFields.status}`);
+        return res.json({ success: true, application: { ...appData, ...updateFields, jobId: appData.job_id, jobTitle: appData.job_title, candidateId: appData.candidate_id, candidateName: appData.candidate_name, candidateEmail: appData.candidate_email, resumeText: appData.resume_text, appliedAt: appData.applied_at } });
+      }
+    } catch (err: any) {
+      console.error('Supabase application update error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const appIndex = db.applications.findIndex((a: any) => a.id === req.params.id);
   if (appIndex !== -1) {
@@ -941,13 +1792,161 @@ app.put('/api/applications/:id', (req, res) => {
     });
 
     saveDB(db);
+    broadcastAlert(`Application for ${db.applications[appIndex].candidateName} updated to stage ${db.applications[appIndex].status}`);
     return res.json({ success: true, application: db.applications[appIndex] });
   }
   res.status(404).json({ success: false, message: 'Application not found' });
 });
 
+// API: Update Application Status (Specialized for Frontend pipeline updates)
+app.put('/api/applications/:id/status', async (req, res) => {
+  const { status, date, time, link, notes } = req.body;
+
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: appData } = await admin.from('applications').select('*').eq('id', req.params.id).maybeSingle();
+      if (appData) {
+        const updateFields: any = { status };
+        if (date) updateFields.interview_date = date;
+        if (time) updateFields.interview_time = time;
+        if (link) updateFields.interview_link = link;
+        if (notes) updateFields.notes = notes;
+
+        await admin.from('applications').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Recruiter/Admin',
+          action: `Application Stage Transitioned to: ${status}`,
+          target: `App for ${appData.job_title} by ${appData.candidate_name}`,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Pipeline update: ${appData.candidate_name} shifted to "${status.replace('_', ' ').toUpperCase()}"`);
+        return res.json({ success: true, application: { ...appData, ...updateFields, jobId: appData.job_id, jobTitle: appData.job_title, candidateId: appData.candidate_id, candidateName: appData.candidate_name, candidateEmail: appData.candidate_email, resumeText: appData.resume_text, appliedAt: appData.applied_at } });
+      }
+    } catch (err: any) {
+      console.error('Supabase application status update error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const appIndex = db.applications.findIndex((a: any) => a.id === req.params.id);
+  if (appIndex !== -1) {
+    db.applications[appIndex].status = status;
+    if (date) db.applications[appIndex].interviewDate = date;
+    if (time) db.applications[appIndex].interviewTime = time;
+    if (link) db.applications[appIndex].interviewLink = link;
+    if (notes) db.applications[appIndex].notes = notes;
+
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Recruiter/Admin',
+      action: `Application Stage Transitioned to: ${status}`,
+      target: `App for ${db.applications[appIndex].jobTitle} by ${db.applications[appIndex].candidateName}`,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Pipeline update: ${db.applications[appIndex].candidateName} shifted to "${status.replace('_', ' ').toUpperCase()}"`);
+    return res.json({ success: true, application: db.applications[appIndex] });
+  }
+  res.status(404).json({ success: false, message: 'Application not found' });
+});
+
+// API: Delete Sourced Job Application
+app.delete('/api/applications/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: appData } = await admin.from('applications').select('*').eq('id', req.params.id).maybeSingle();
+      if (appData) {
+        await admin.from('applications').delete().eq('id', req.params.id);
+
+        const { data: job } = await admin.from('jobs').select('applied_count').eq('id', appData.job_id).maybeSingle();
+        if (job) {
+          await admin.from('jobs').update({ applied_count: Math.max(0, (job.applied_count || 1) - 1) }).eq('id', appData.job_id);
+        }
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Deleted Job Application',
+          target: `${appData.candidate_name} for ${appData.job_title}`,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Application for ${appData.candidate_name} deleted successfully`);
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase application delete error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const appIndex = db.applications.findIndex((a: any) => a.id === req.params.id);
+  if (appIndex !== -1) {
+    const app = db.applications[appIndex];
+    db.applications.splice(appIndex, 1);
+
+    const job = db.jobs.find((j: any) => j.id === app.jobId);
+    if (job) {
+      job.appliedCount = Math.max(0, (job.appliedCount || 0) - 1);
+    }
+
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin',
+      action: 'Deleted Job Application',
+      target: `${app.candidateName} for ${app.jobTitle}`,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Application for ${app.candidateName} deleted successfully`);
+    return res.json({ success: true });
+  }
+  res.status(404).json({ success: false, message: 'Application not found' });
+});
+
 // API: CMS Settings Updates
-app.put('/api/settings', (req, res) => {
+app.put('/api/settings', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const updateFields = {
+        company_name: req.body.companyName,
+        tagline: req.body.tagline,
+        phone: req.body.phone,
+        personal_email: req.body.personalEmail,
+        company_email: req.body.companyEmail,
+        address: req.body.address,
+        whatsapp: req.body.whatsapp,
+        map_url: req.body.mapUrl,
+        social_links: req.body.socialLinks || {},
+        smtp_settings: req.body.smtpSettings || {},
+        seo_settings: req.body.seoSettings || {}
+      };
+
+      await admin.from('settings').upsert({ id: 'global', ...updateFields });
+
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: 'Admin',
+        action: 'System Settings Updated',
+        target: 'Global Settings',
+        timestamp: new Date().toISOString()
+      });
+
+      broadcastAlert('Agency global settings updated successfully');
+      return res.json({ success: true, settings: req.body });
+    } catch (err: any) {
+      console.error('Supabase settings update error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   db.settings = { ...db.settings, ...req.body };
 
@@ -964,7 +1963,39 @@ app.put('/api/settings', (req, res) => {
 });
 
 // API: CMS Blogs CRUD
-app.post('/api/blogs', (req, res) => {
+app.post('/api/blogs', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newBlog = {
+        id: `blog-${Date.now()}`,
+        title: req.body.title,
+        content: req.body.content,
+        author: req.body.author || 'Admin',
+        category: req.body.category || 'General',
+        image: req.body.image || '',
+        read_time: req.body.readTime || '5 min read',
+        views: 0,
+        date: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
+        created_at: new Date().toISOString()
+      };
+
+      await admin.from('blogs').insert(newBlog);
+
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: 'Admin',
+        action: 'Blog Post Created',
+        target: newBlog.title,
+        timestamp: new Date().toISOString()
+      });
+
+      return res.status(201).json({ success: true, blog: { ...newBlog, readTime: newBlog.read_time } });
+    } catch (err: any) {
+      console.error('Supabase blog create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newBlog = {
     id: `blog-${Date.now()}`,
@@ -986,7 +2017,39 @@ app.post('/api/blogs', (req, res) => {
   res.status(201).json({ success: true, blog: newBlog });
 });
 
-app.put('/api/blogs/:id', (req, res) => {
+app.put('/api/blogs/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: blog } = await admin.from('blogs').select('*').eq('id', req.params.id).maybeSingle();
+      if (blog) {
+        const updateFields = {
+          title: req.body.title || blog.title,
+          content: req.body.content || blog.content,
+          author: req.body.author || blog.author,
+          category: req.body.category || blog.category,
+          image: req.body.image || blog.image,
+          read_time: req.body.readTime || blog.read_time,
+          views: req.body.views !== undefined ? req.body.views : blog.views
+        };
+
+        await admin.from('blogs').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Blog Post Updated',
+          target: updateFields.title,
+          timestamp: new Date().toISOString()
+        });
+
+        return res.json({ success: true, blog: { ...blog, ...updateFields, readTime: updateFields.read_time } });
+      }
+    } catch (err: any) {
+      console.error('Supabase blog update error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const blogIndex = db.blogs.findIndex((b: any) => b.id === req.params.id);
   if (blogIndex !== -1) {
@@ -1006,7 +2069,29 @@ app.put('/api/blogs/:id', (req, res) => {
   res.status(404).json({ success: false, message: 'Blog not found' });
 });
 
-app.delete('/api/blogs/:id', (req, res) => {
+app.delete('/api/blogs/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: blog } = await admin.from('blogs').select('*').eq('id', req.params.id).maybeSingle();
+      if (blog) {
+        await admin.from('blogs').delete().eq('id', req.params.id);
+        
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Blog Post Deleted',
+          target: blog.title,
+          timestamp: new Date().toISOString()
+        });
+
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase blog delete error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const blogIndex = db.blogs.findIndex((b: any) => b.id === req.params.id);
   if (blogIndex !== -1) {
@@ -1028,7 +2113,39 @@ app.delete('/api/blogs/:id', (req, res) => {
 });
 
 // API: Company (Employer) Operations
-app.post('/api/companies', (req, res) => {
+app.post('/api/companies', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newCompany = {
+        id: `company-${Date.now()}`,
+        name: req.body.name,
+        industry: req.body.industry || 'IT & Software',
+        contact_email: req.body.contactEmail,
+        contact_phone: req.body.contactPhone || '',
+        address: req.body.address || '',
+        description: req.body.description || '',
+        status: 'pending',
+        logo: req.body.logo || '',
+        created_at: new Date().toISOString()
+      };
+
+      await admin.from('companies').insert(newCompany);
+
+      await admin.from('activity_logs').insert({
+        id: `log-${Date.now()}`,
+        user_name: 'Self-Registered',
+        action: 'Company Sourcing Applied',
+        target: newCompany.name,
+        timestamp: new Date().toISOString()
+      });
+
+      return res.status(201).json({ success: true, company: { ...newCompany, contactEmail: newCompany.contact_email, contactPhone: newCompany.contact_phone } });
+    } catch (err: any) {
+      console.error('Supabase company create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newCompany = {
     id: `company-${Date.now()}`,
@@ -1050,7 +2167,40 @@ app.post('/api/companies', (req, res) => {
   res.status(201).json({ success: true, company: newCompany });
 });
 
-app.put('/api/companies/:id', (req, res) => {
+app.put('/api/companies/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: comp } = await admin.from('companies').select('*').eq('id', req.params.id).maybeSingle();
+      if (comp) {
+        const updateFields = {
+          name: req.body.name || comp.name,
+          industry: req.body.industry || comp.industry,
+          contact_email: req.body.contactEmail || comp.contact_email,
+          contact_phone: req.body.contactPhone || comp.contact_phone,
+          address: req.body.address || comp.address,
+          description: req.body.description || comp.description,
+          status: req.body.status || comp.status,
+          logo: req.body.logo || comp.logo
+        };
+
+        await admin.from('companies').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: `Company Status Changed to: ${updateFields.status}`,
+          target: updateFields.name,
+          timestamp: new Date().toISOString()
+        });
+
+        return res.json({ success: true, company: { ...comp, ...updateFields, contactEmail: updateFields.contact_email, contactPhone: updateFields.contact_phone } });
+      }
+    } catch (err: any) {
+      console.error('Supabase company update error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const compIndex = db.companies.findIndex((c: any) => c.id === req.params.id);
   if (compIndex !== -1) {
@@ -1070,7 +2220,29 @@ app.put('/api/companies/:id', (req, res) => {
   res.status(404).json({ success: false, message: 'Company not found' });
 });
 
-app.delete('/api/companies/:id', (req, res) => {
+app.delete('/api/companies/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: comp } = await admin.from('companies').select('*').eq('id', req.params.id).maybeSingle();
+      if (comp) {
+        await admin.from('companies').delete().eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Company Deleted',
+          target: comp.name,
+          timestamp: new Date().toISOString()
+        });
+
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase company delete error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const compIndex = db.companies.findIndex((c: any) => c.id === req.params.id);
   if (compIndex !== -1) {
@@ -1091,8 +2263,131 @@ app.delete('/api/companies/:id', (req, res) => {
   res.status(404).json({ success: false, message: 'Company not found' });
 });
 
+// API: Candidates Update/Vetting Endpoint
+app.put('/api/candidates/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: cand } = await admin.from('candidates').select('*').eq('id', req.params.id).maybeSingle();
+      if (cand) {
+        const updateFields = {
+          name: req.body.name || cand.name,
+          phone: req.body.phone || cand.phone,
+          skills: req.body.skills || cand.skills,
+          experience: req.body.experience || cand.experience,
+          education: req.body.education || cand.education,
+          resume_text: req.body.resumeText || cand.resume_text,
+          saved_jobs: req.body.savedJobs || cand.saved_jobs,
+          certificates: req.body.certificates || cand.certificates,
+          background_verified: req.body.backgroundVerified !== undefined ? req.body.backgroundVerified : cand.background_verified
+        };
+
+        await admin.from('candidates').update(updateFields).eq('id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin/Candidate',
+          action: 'Candidate Profile Updated',
+          target: updateFields.name,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Candidate profile updated: ${updateFields.name}`);
+        return res.json({ success: true, candidate: { ...cand, ...updateFields, resumeText: updateFields.resume_text, savedJobs: updateFields.saved_jobs, backgroundVerified: updateFields.background_verified } });
+      }
+    } catch (err: any) {
+      console.error('Supabase candidate update error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const candIndex = db.candidates.findIndex((c: any) => c.id === req.params.id);
+  if (candIndex !== -1) {
+    db.candidates[candIndex] = { ...db.candidates[candIndex], ...req.body };
+
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin/Candidate',
+      action: 'Candidate Profile Updated',
+      target: db.candidates[candIndex].name,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Candidate profile updated: ${db.candidates[candIndex].name}`);
+    return res.json({ success: true, candidate: db.candidates[candIndex] });
+  }
+  res.status(404).json({ success: false, message: 'Candidate not found' });
+});
+
+// API: Candidates Deletion Endpoint
+app.delete('/api/candidates/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const { data: cand } = await admin.from('candidates').select('*').eq('id', req.params.id).maybeSingle();
+      if (cand) {
+        await admin.from('candidates').delete().eq('id', req.params.id);
+        await admin.from('applications').delete().eq('candidate_id', req.params.id);
+
+        await admin.from('activity_logs').insert({
+          id: `log-${Date.now()}`,
+          user_name: 'Admin',
+          action: 'Candidate Profile Deleted',
+          target: cand.name,
+          timestamp: new Date().toISOString()
+        });
+
+        broadcastAlert(`Candidate profile for ${cand.name} removed by administrator`);
+        return res.json({ success: true });
+      }
+    } catch (err: any) {
+      console.error('Supabase candidate delete error, falling back:', err.message || err);
+    }
+  }
+
+  const db = getDB();
+  const candIndex = db.candidates.findIndex((c: any) => c.id === req.params.id);
+  if (candIndex !== -1) {
+    const candName = db.candidates[candIndex].name;
+    db.candidates.splice(candIndex, 1);
+
+    db.applications = db.applications.filter((a: any) => a.candidateId !== req.params.id);
+
+    db.auditLogs.unshift({
+      id: `log-${Date.now()}`,
+      user: 'Admin',
+      action: 'Candidate Profile Deleted',
+      target: candName,
+      timestamp: new Date().toISOString()
+    });
+
+    saveDB(db);
+    broadcastAlert(`Candidate profile for ${candName} removed by administrator`);
+    return res.json({ success: true });
+  }
+  res.status(404).json({ success: false, message: 'Candidate not found' });
+});
+
 // API: FAQ items
-app.post('/api/faqs', (req, res) => {
+app.post('/api/faqs', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newFaq = {
+        id: `faq-${Date.now()}`,
+        question: req.body.question,
+        answer: req.body.answer,
+        category: req.body.category || 'General'
+      };
+
+      await admin.from('faqs').insert(newFaq);
+      return res.status(201).json({ success: true, faq: newFaq });
+    } catch (err: any) {
+      console.error('Supabase FAQ create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newFaq = {
     id: `faq-${Date.now()}`,
@@ -1103,7 +2398,17 @@ app.post('/api/faqs', (req, res) => {
   res.status(201).json({ success: true, faq: newFaq });
 });
 
-app.delete('/api/faqs/:id', (req, res) => {
+app.delete('/api/faqs/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      await admin.from('faqs').delete().eq('id', req.params.id);
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error('Supabase FAQ delete error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const index = db.faqs.findIndex((f: any) => f.id === req.params.id);
   if (index !== -1) {
@@ -1115,7 +2420,27 @@ app.delete('/api/faqs/:id', (req, res) => {
 });
 
 // API: Testimonials CMS
-app.post('/api/testimonials', (req, res) => {
+app.post('/api/testimonials', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      const newTest = {
+        id: `test-${Date.now()}`,
+        name: req.body.name,
+        role: req.body.role,
+        company: req.body.company,
+        content: req.body.content,
+        image: req.body.image || '',
+        rating: req.body.rating || 5
+      };
+
+      await admin.from('testimonials').insert(newTest);
+      return res.status(201).json({ success: true, testimonial: newTest });
+    } catch (err: any) {
+      console.error('Supabase testimonial create error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const newTest = {
     id: `test-${Date.now()}`,
@@ -1127,7 +2452,17 @@ app.post('/api/testimonials', (req, res) => {
   res.status(201).json({ success: true, testimonial: newTest });
 });
 
-app.delete('/api/testimonials/:id', (req, res) => {
+app.delete('/api/testimonials/:id', async (req, res) => {
+  if (isSupabaseConfigured()) {
+    try {
+      const admin = getSupabaseAdmin();
+      await admin.from('testimonials').delete().eq('id', req.params.id);
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error('Supabase testimonial delete error, falling back:', err.message || err);
+    }
+  }
+
   const db = getDB();
   const index = db.testimonials.findIndex((t: any) => t.id === req.params.id);
   if (index !== -1) {
@@ -1354,4 +2689,5 @@ async function startFullStackApp() {
 
 // Bootstrap and run
 getDB();
+bootstrapSupabase();
 startFullStackApp();
